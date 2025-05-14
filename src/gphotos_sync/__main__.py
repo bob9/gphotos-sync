@@ -251,6 +251,12 @@ class GooglePhotosSyncMain:
         "(for testing)",
     )
     parser.add_argument(
+        "--preserve-album-links",
+        action="store_true",
+        help="Preserve existing album links structure and only update when necessary."
+        " Prevents files from appearing to disappear and reappear in other programs.",
+    )
+    parser.add_argument(
         "--case-insensitive-fs",
         action="store_true",
         help="add this flag if your filesystem is case insensitive",
@@ -401,6 +407,7 @@ class GooglePhotosSyncMain:
             image_timeout=args.image_timeout,
             video_timeout=args.video_timeout,
             no_album_sorting=args.no_album_sorting,
+            preserve_album_links=args.preserve_album_links,
         )
 
         self.google_photos_client = RestClient(

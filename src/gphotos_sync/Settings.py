@@ -51,3 +51,4 @@ class Settings:
 
     image_timeout: int
     video_timeout: int
+    preserve_album_links: bool = False

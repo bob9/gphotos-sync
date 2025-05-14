@@ -75,6 +75,7 @@ class GoogleAlbumsSync(object):
         self.month_format = settings.month_format
         self.path_format = settings.path_format
         self._no_album_sorting = settings.no_album_sorting
+        self._preserve_album_links = settings.preserve_album_links
 
     @classmethod
     def make_search_parameters(
@@ -285,16 +286,28 @@ class GoogleAlbumsSync(object):
         album_item = 0
         current_rid = ""
 
-        # always re-create all album links - it is quite fast and a good way
-        # to ensure consistency
-        # especially now that we have --album-date-by-first-photo
-        if self._albums_root.exists():
-            log.debug("removing previous album links tree")
-            shutil.rmtree(self._albums_root)
-        if self._shared_albums_root.exists():
-            log.debug("removing previous shared album links tree")
-            shutil.rmtree(self._shared_albums_root)
+        # Only remove and recreate all album links if not preserving links
+        if not self._preserve_album_links:
+            # always re-create all album links - it is quite fast and a good way
+            # to ensure consistency
+            # especially now that we have --album-date-by-first-photo
+            if self._albums_root.exists():
+                log.debug("removing previous album links tree")
+                shutil.rmtree(self._albums_root)
+            if self._shared_albums_root.exists():
+                log.debug("removing previous shared album links tree")
+                shutil.rmtree(self._shared_albums_root)
+        
+        # Create album directory structure if it doesn't exist
+        if not self._albums_root.exists():
+            self._albums_root.mkdir(parents=True, exist_ok=True)
+        if not self._shared_albums_root.exists():
+            self._shared_albums_root.mkdir(parents=True, exist_ok=True)
+            
         re_download = not self._albums_root.exists()
+
+        # When preserving album links, keep track of valid links to detect ones to remove later
+        valid_links = set() if self._preserve_album_links else None
 
         for (
             path,
@@ -340,6 +353,11 @@ class GoogleAlbumsSync(object):
 
             link_filename = link_filename[: get_check().max_filename]
             link_file = link_folder / link_filename
+            
+            # Keep track of valid links when preserving
+            if self._preserve_album_links:
+                valid_links.add(str(link_file))
+                
             # incredibly, pathlib.Path.relative_to cannot handle
             # '../' in a relative path !!! reverting to os.path
             relative_filename = os.path.relpath(full_file_name, str(link_folder))
@@ -351,12 +369,40 @@ class GoogleAlbumsSync(object):
 
                 created_date = Utils.string_to_date(created)
                 if full_file_name.exists():
-                    if self._use_hardlinks:
-                        os.link(full_file_name, link_file)
-                    elif self._ntfs_override:
-                        os.symlink(relative_filename, link_file)
-                    else:
-                        link_file.symlink_to(relative_filename)
+                    # When preserving album links, check if the link already exists and points to the right target
+                    create_link = True
+                    if self._preserve_album_links and link_file.exists():
+                        # Check if it's a symlink or hardlink to the correct target
+                        if self._use_hardlinks:
+                            # For hardlinks we check if both exist and have same inode
+                            if link_file.exists() and full_file_name.exists() and \
+                               link_file.stat().st_ino == full_file_name.stat().st_ino:
+                                create_link = False
+                        else:
+                            # For symlinks, check if it points to the correct relative path
+                            try:
+                                if link_file.is_symlink() and os.readlink(str(link_file)) == relative_filename:
+                                    create_link = False
+                            except (OSError, ValueError):
+                                # If the link is broken, we'll recreate it
+                                pass
+                    
+                    # Create or recreate the link if needed
+                    if create_link:
+                        # Remove existing link if it exists
+                        if link_file.exists():
+                            if link_file.is_symlink() or self._use_hardlinks:
+                                link_file.unlink()
+                            else:
+                                log.warning(f"Could not update link {link_file}: not a link")
+                                
+                        # Create the link
+                        if self._use_hardlinks:
+                            os.link(full_file_name, link_file)
+                        elif self._ntfs_override:
+                            os.symlink(relative_filename, link_file)
+                        else:
+                            link_file.symlink_to(relative_filename)
                 else:
                     log.debug("skip link for %s, not downloaded", file_name)
 
@@ -383,4 +429,56 @@ class GoogleAlbumsSync(object):
             except UnicodeEncodeError as err:
                 log.error("unicode error linking %s: %s", full_file_name, err)
 
-        log.warning("Created %d new album folder links", count)
+        # When preserving links, remove any links that no longer should exist
+        removed_count = 0
+        if self._preserve_album_links and valid_links:
+            # Process regular albums
+            if self._albums_root.exists():
+                removed_count += self._clean_up_stale_links(self._albums_root, valid_links)
+            # Process shared albums
+            if self._shared_albums_root.exists():
+                removed_count += self._clean_up_stale_links(self._shared_albums_root, valid_links)
+
+        if self._preserve_album_links:
+            log.warning("Created or updated %d album folder links, removed %d stale links", count, removed_count)
+        else:
+            log.warning("Created %d new album folder links", count)
+
+    def _clean_up_stale_links(self, root_dir: Path, valid_links: set) -> int:
+        """Removes links that no longer should exist in the album structure.
+        
+        Args:
+            root_dir: The root directory to search for links
+            valid_links: Set of validated link paths (as strings)
+            
+        Returns:
+            Number of removed links
+        """
+        removed_count = 0
+        
+        # Recursively process each directory
+        for path in root_dir.glob('**/*'):
+            # Skip directories
+            if path.is_dir():
+                continue
+                
+            # If link isn't in our valid_links set and it's a symlink or hardlink, remove it
+            if str(path) not in valid_links:
+                try:
+                    if path.is_symlink() or (self._use_hardlinks and path.exists()):
+                        log.debug(f"Removing stale link: {path}")
+                        path.unlink()
+                        removed_count += 1
+                except (OSError, PermissionError) as err:
+                    log.error(f"Error removing stale link {path}: {err}")
+                    
+        # Remove empty directories
+        for path in sorted(root_dir.glob('**/*'), key=lambda p: len(str(p)), reverse=True):
+            if path.is_dir() and not any(path.iterdir()):
+                try:
+                    log.debug(f"Removing empty directory: {path}")
+                    path.rmdir()
+                except (OSError, PermissionError) as err:
+                    log.error(f"Error removing empty directory {path}: {err}")
+        
+        return removed_count
